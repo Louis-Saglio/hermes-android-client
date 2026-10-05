@@ -3,3 +3,11 @@ build/
 local.properties
 *.iml
 .idea/
+.kotlin/
+captures/
+*.apk
+
+# Local-only, machine/user-specific — never commit (repo is public)
+AGENTS.local.md
+google-services.json
+scripts/*.local.*
