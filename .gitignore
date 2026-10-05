@@ -12,3 +12,5 @@ AGENTS.local.md
 google-services.json
 scripts/*.local.*
 .probe/
+__pycache__/
+*.pyc
