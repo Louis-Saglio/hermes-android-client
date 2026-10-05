@@ -147,9 +147,14 @@ Notes:
 - `session.status` returns **human-readable prose** (`"Hermes TUI Status\n\nSession ID: …"`):
   fine for a debug screen, wrong for app state — use the structured RPCs. *(verified)*
 - `row_id` (durable SQLite row id) is the preferred address for rewind (`truncate_before_row_id`);
-  ordinals are the back-compat path. A rewind requires explicit `confirm_truncate`, and while a turn
-  runs a rewind is refused `4009` (session busy) rather than queued — interrupt first, then resubmit.
-  *(docs)*
+  ordinals are the back-compat path. **Row ids are global across sessions** (one `messages`
+  table: probe sessions drew 8, 18, 21, 22…), never per-session. A rewind requires explicit
+  `confirm_truncate`, and while a turn runs a rewind is refused `4009` (session busy) rather than
+  queued — interrupt first, then resubmit. *(verified)*
+- History rows are heterogeneous *(verified)*: `role:"tool"` rows carry `text:null` (tool I/O
+  lives in events/transcript payloads); an assistant row can be empty when the turn's pre-tool
+  content was reasoning-only; mid-turn user injections land with `display_kind:"steer"`.
+  `display_kind` / `display_metadata` is the timeline-marker channel.
 - Session lifecycle set: `create / resume / activate / active_list / close / delete / archive /
   branch / branch_stored / branch_whole / compress / undo / title / save / set_hidden / info /
   context_breakdown / events.since / events.stats / most_recent / workspace.move / cwd.set /
