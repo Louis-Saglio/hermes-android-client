@@ -223,18 +223,39 @@ methods.)*
 - Attaching a second client to a live session adds a subscriber (streaming goes to all attached
   clients; disconnecting one doesn't end the session). Submit exclusivity and busy-input policy
   still apply per session. *(docs)*
-- Busy-input policy: an ordinary `prompt.submit` during a running turn is steered/queued per
-  `display.busy_input_mode`; a rewind submit is refused `4009`. `session.steer` injects mid-turn
-  guidance delivered at the next tool boundary. *(docs)*
+- Busy-input policy **(verified)**: an ordinary `prompt.submit` during a running turn is queued —
+  ack `{"result":{"status":"queued"}}` — and becomes the next turn. Race caveat: submitting while
+  the first turn is still *starting* (before any delta) can **supersede** it: the first turn ends
+  immediately with a placeholder `message.complete` (`"Stopped waiting for another Hermes process
+  on this session. Your message was not processed."`, zero usage, `status:"interrupted"`) and the
+  queued prompt takes over (the auto-title is then derived from the winning prompt). A rewind
+  submit during a running turn is refused `4009` instead — interrupt first, then resubmit.
+- `session.interrupt` answers `{"result":{"status":"interrupted"}}` **(verified)**.
+- `session.steer` answers `{"result":{"status":"queued","text":...}}`; the text is delivered at the
+  next tool boundary (the model's continuation honors it) and **persists in history as a
+  `role:"user"` row with `display_kind:"steer"`** — render it as an inline marker, not a user
+  bubble. **(verified end-to-end)**
 
 ## Errors
 
-Standard JSON-RPC: `-32700` parse error, `-32601` method not found, `-32602` invalid params
-(includes model/provider override rejection with `error.data.suggestions`), `-32603` internal.
-Gateway params validation answers **`4000`** with the offending field path (unknown or mistyped
-key — never silently ignored; `contracts/registry.py`). Rewind guard codes *(docs)*: `4004`
-(missing/invalid truncate intent), `4009` (session busy), `4018` (stale/unknown `row_id`),
-`4029`/`4030` (truncate without confirm / id–ordinal mismatch).
+Standard JSON-RPC: `-32700` parse error, `-32601` method not found, `-32602` invalid params,
+`-32603` internal. Gateway-specific codes (all verified live unless noted):
+
+| Code | Meaning | Verified case |
+|---|---|---|
+| `-32601` | unknown method | `no.such.method`, `session.frobnicate` — message adds *"client and backend out of sync, run `hermes update`"* |
+| `-32602` | invalid params | `session.create` with `model:"gpt-5.5", provider:"anthropic"` — message lists closest models (`error.data.suggestions`) |
+| `4000` | params contract violation | `session.create` with unknown key → `bogus_key: Extra inputs are not permitted` + field path |
+| `4001` | session not found | `session.usage` with a bad `session_id` |
+| `4007` | session not found (resume path) | `session.resume` with a bad stored id — **different code per method** |
+| `4009` | session busy | rewind `prompt.submit` while a turn runs |
+| `4018` | rewind target not in history | stale `truncate_before_row_id` — `error.data` carries `user_turn_count`, `ordinal`, `segment_ordinal`, `prefix_user_count` |
+| `4029` | truncation without `confirm_truncate` | `prompt.submit` with `truncate_before_user_ordinal` only |
+| `4004` | invalid truncate intent / boolean as target | *(docs-derived)* |
+
+Caveat: params validation is Pydantic-**coercive**, not strict — `session.create {title: 42}`
+succeeded (coerced to `"42"`). Don't rely on the server to reject wrong-but-coercible types.
+*(verified)*
 
 ## Full surface
 
@@ -269,3 +290,4 @@ document's core-loop round-trips). Raw frame captures stay local (`.probe/captur
 | Date | Hermes | What was verified live |
 |---|---|---|
 | 2026-10-05 | 0.21.5 | Transport + ungated auth; `gateway.ready`; `client.capabilities`; `session.create/list/usage/history/status`; `prompt.submit` ×2 (plain + terminal tool); full turn event sequence; `tool.start/complete` verbatim. |
+| 2026-10-05 | 0.21.5 | `session.steer` (queued → delivered at tool boundary → persisted as `display_kind:"steer"`); `session.interrupt`; busy queueing + turn-supersede race; errors `-32601/-32602/4000/4001/4007/4009/4018/4029`; params coercion caveat; global `row_id` space. |
