@@ -197,37 +197,55 @@ delta types still to be pinned down — treat both as collapsible "thinking" UI.
 ## Server→client requests
 
 Approvals, clarify questions, sudo/secret prompts, vault unlocks, connection cards and the desktop
-read/act bridges are **requests from the server bearing a string id** — answer with a response
-frame carrying the same id:
+read/act bridges are **requests from the server bearing a string id** (`srq-<hex>`) — answer with a
+response frame carrying the same id. Result shapes: `approval → {choice}`; `clarify → {answers}`
+keyed by question id (`{}` cancels, `null` skips; `clarify.lock` locks one answer early); `sudo`,
+`secret`, `vault.code`, `vault.unlock_prompt → {value}`; `connection → {settled_by, targets}`;
+`terminal.read`, `window.read`, `preview.act`, `tour → {value}` (JSON text). Answer with JSON-RPC
+error `-32601` for methods the client doesn't implement so the agent fails fast. When the server
+withdraws a question (timeout, interrupt, answered from another surface) it emits
+`request.cancel {id, method, reason}`. (13 request methods — see catalog.)
 
-```text
-← {"jsonrpc":"2.0","id":"srq-7","method":"approval","params":{"session_id":"…","request_id":"…",
-   "command":"rm -rf build","description":"…"}}
-→ {"jsonrpc":"2.0","id":"srq-7","result":{"choice":"once"}}
+### Approval flow — verified end-to-end (approvals.mode: manual)
+
+The current mode rides the `session.info` **event** (`approval_mode`, `yolo`), not the
+`session.create` result's `info`. Request payload, verbatim:
+
+```json
+{"jsonrpc":"2.0","id":"srq-08e6b7d0c8bb","method":"approval","params":{
+ "session_id":"5e42778d","command":"rm -rf /tmp/probe-danger-a && echo CLEANED_A",
+ "pattern_key":"delete in root path","pattern_keys":["delete in root path"],
+ "description":"delete in root path","allow_permanent":true,"allow_session":true,
+ "request_id":"…"}}
 ```
 
-Result shapes: `approval → {choice}`; `clarify → {answers}` keyed by question id (`{}` cancels,
-`null` skips; `clarify.lock` locks one answer early); `sudo`, `secret`, `vault.code`,
-`vault.unlock_prompt → {value}`; `connection → {settled_by, targets}`; `terminal.read`,
-`window.read`, `preview.act`, `tour → {value}` (JSON text). Answer with JSON-RPC error `-32601`
-for methods the client doesn't implement so the agent fails fast instead of waiting out the
-timeout. When the server withdraws a question (timeout, interrupt, answered from another surface)
-it emits `request.cancel {id, method, reason}`. *(Docs, programmatic-integration page — the
-`approval` flow itself is verified in the probe captures of later probes; catalog lists 13 request
-methods.)*
+- `choice` enum: `once | session | always | deny` (`contracts/server_requests.py::ApprovalChoice`).
+- While a request is open, `approval.pending {session_id}` replays it (same fields) — the
+  reconnect/polling path. **(verified)**
+- Answering `{"choice":"once"}` → the command runs; `tool.complete.result` carries an extra
+  `approval` field. Answering `{"choice":"deny"}` → `tool.complete` with `output:""`,
+  `exit_code:-1`, `error:"BLOCKED: Command denied by user. …"` and the model wraps up explaining
+  it won't retry. **(both verified)**
 
-## Reconnect & resume
+## Reconnect & resume — verified end-to-end
 
-- `session.resume` / `session.activate` results carry `inflight` (the still-running or retained
-  failed turn: `user`, partial `assistant`, `streaming`, mid-turn `corrections`, error fields, and
-  `display_kind`/`display_metadata` for gateway-originated turns) and `open_requests` (the
-  still-open server→client frames, re-answerable). Rebuild UI from those, then re-subscribe to live
-  events. *(docs + `contracts/sessions.py::InflightTurn`)*
-- `session.events.since` replays missed events; `gateway.ready.payload.replay_epoch` changes on
-  backend restart → drop per-session watermarks.
-- Attaching a second client to a live session adds a subscriber (streaming goes to all attached
-  clients; disconnecting one doesn't end the session). Submit exclusivity and busy-input policy
-  still apply per session. *(docs)*
+Verified scenario: WS dropped mid-turn (terminal `sleep` tool running), reconnect,
+`session.resume`, `session.events.since`, live re-attach until `message.complete`.
+
+- `session.resume {session_id: <STORED id or exact title>}` result keys:
+  `session_id (runtime), session_key, resumed, running, status, started_at, turn_started_at,
+  message_count, messages, messages_omitted, info, inflight, open_requests` *(open_requests:
+  `null` when none)*. `inflight` is the live-turn snapshot:
+  `{"user":"…","assistant":"","streaming":true}` — rebuild the in-flight bubble from it.
+  **(verified)**
+- `session.events.since {session_id, last_seen}` → `{events, count, latest_seq, truncated, epoch,
+  open_requests}`; `truncated:true` means refetch state instead. Events carry a per-session `seq`
+  watermark (`last_seen`). **(verified: 34 events replayed after last_seen:0)**
+- After resume, live turn events keep flowing to the new connection (multi-subscriber attach).
+  A `session.reclaimed {session_id, stored_session_id, reason:"ws_orphan_reap"}` event is emitted
+  on lease moves — it is delivered as a **global** frame (top-level `session_id` empty, id in the
+  payload), so filter by payload id. **(verified)**
+- `gateway.ready.payload.replay_epoch` changes on backend restart → drop watermarks.
 - Busy-input policy **(verified)**: an ordinary `prompt.submit` during a running turn is queued —
   ack `{"result":{"status":"queued"}}` — and becomes the next turn. Race caveat: submitting while
   the first turn is still *starting* (before any delta) can **supersede** it: the first turn ends
@@ -296,3 +314,4 @@ document's core-loop round-trips). Raw frame captures stay local (`.probe/captur
 |---|---|---|
 | 2026-10-05 | 0.21.5 | Transport + ungated auth; `gateway.ready`; `client.capabilities`; `session.create/list/usage/history/status`; `prompt.submit` ×2 (plain + terminal tool); full turn event sequence; `tool.start/complete` verbatim. |
 | 2026-10-05 | 0.21.5 | `session.steer` (queued → delivered at tool boundary → persisted as `display_kind:"steer"`); `session.interrupt`; busy queueing + turn-supersede race; errors `-32601/-32602/4000/4001/4007/4009/4018/4029`; params coercion caveat; global `row_id` space. |
+| 2026-10-05 | 0.21.5 | Approval flow end-to-end (mode manual): request payload, `approval.pending` replay, `once` (runs, `result.approval`) and `deny` (`exit_code:-1`, `BLOCKED`); `approval_mode` in `session.info` event. Reconnect: WS drop mid-turn → `session.resume` (`inflight`, result keys), `session.events.since` (seq watermark, `truncated`, `epoch`), live re-attach, `session.reclaimed` global frame. |
