@@ -11,3 +11,4 @@ captures/
 AGENTS.local.md
 google-services.json
 scripts/*.local.*
+.probe/
