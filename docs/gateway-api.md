@@ -30,43 +30,55 @@ served over WebSocket (and stdio). This is the protocol the Android client imple
   server-side** and flushed in batches (~30 fps); any non-streaming frame flushes ahead, so ordering
   is preserved. Clients must tolerate burst delivery. *(code-derived, `tui_gateway/ws.py`)*
 
-## Authentication
+## Authentication — fully verified (p08)
 
-Two modes, decided by whether the server has an auth provider configured
-(`GET /api/status` → `auth_required`, `auth_providers`, `auth_flows`).
+The gate engages on a **non-loopback bind OR a non-loopback `dashboard.public_url`** — *not* merely
+when a provider is configured. **Loopback relaxation (verified): with a provider configured but a
+loopback bind and no external public URL, `GET /api/status` still reports `auth_required:false`,
+`auth_flows:[]`, and the only WS credential is the legacy session token.** Exception: a
+Desktop-owned loopback backend (`HERMES_DESKTOP=1` + session token env) is exempt from the gate
+even with an external public URL (`web_server.py::_desktop_loopback_auth_exempt`).
 
-### Ungated (loopback, no auth provider) — verified live
+Check `GET /api/status` first: `auth_required`, `auth_providers`, `auth_flows`.
+
+### Ungated (loopback relaxation) — verified live
 
 Every request carries the in-process session token:
 
 - REST: header `X-Hermes-Session-Token: <token>`
-- WS: query param `?token=<token>` (constant-time compared; missing → `no_credential`, wrong →
-  `token_mismatch`, upgrade rejected)
+- WS: query param `?token=<token>` (constant-time compared; missing → `no_credential` → HTTP 403,
+  wrong → `token_mismatch`)
 
 The token comes from env `HERMES_DASHBOARD_SESSION_TOKEN` at server start, else is randomly
-generated per process and injected into the SPA (`window.__HERMES_SESSION_TOKEN__`). It dies with
-the process. Verified: probe gateway answered `/api/status` and `/api/ws` with the token, rejected
-nothing else (no third leg in ungated mode).
+generated per process and injected into the SPA. It dies with the process.
 
-### Gated (auth provider configured) — *(code-derived, `hermes_cli/web_server_chat.py::_ws_auth_reason`)*
+### Gated — verified end-to-end (basic-auth provider, `auth_flows: ["cookie","native_pkce"]`)
 
-WS upgrade accepts, in order:
+WS upgrade accepts, in order: `?internal=` (server-spawned only), `?ticket=` (browser, single-use),
+`?token=` (user session access token, verified against providers) — or a ticket via the
+`hermes-gateway-ticket.<ticket>` subprotocol. Verified negatives: no credential → 403; the legacy
+session token → **403 in gated mode** (leaked-constant safety); wrong password → 401 generic.
 
-1. `?internal=` — process-lifetime credential for server-spawned WS clients only (never for apps).
-2. `?ticket=` — browser-minted, **single-use, 30 s TTL**. Also accepted via WebSocket subprotocol
-   `hermes-gateway-ticket.<ticket>` alongside the stable public protocol (the ticket protocol is a
-   credential: never reflected back, never logged).
-3. `?token=` — a **user session access token** verified against the dashboard auth providers (same
-   `verify_session` seam as REST bearer). This is what a remote native client uses after sign-in.
+**RFC 8252 native sign-in (the mobile-app path), verified chain:**
 
-Remote native sign-in (the flow the desktop app uses, and the one a mobile app should use):
-RFC 8252 PKCE against the gateway's `/auth/native/*` endpoints —
-`GET /auth/native/authorize` (system browser, loopback redirect) → `POST /auth/native/token`
-(code + verifier) → `{access_token, refresh_token, expires_at}`; rotate with
-`POST /auth/native/refresh`. The gateway brokers the flow to the upstream IDP; capability is
-advertised in `GET /api/status` → `auth_flows: ["cookie","native_pkce"]`. REST calls then use
-`Authorization: Bearer <access_token>`; the WS upgrade uses `?token=<access_token>`.
-Password providers land the browser on the gateway's `/login` form instead (same brokered flow).
+1. `GET /auth/native/authorize?provider=basic&code_challenge=<S256>&code_challenge_method=S256&
+   redirect_uri=<loopback>&state=<s>` → 302 to `/login` + `hermes_session_pkce` cookie holding the
+   broker state. (Without `provider=` and several providers: an HTML chooser.)
+2. `POST /auth/password-login` JSON `{provider, username, password, next}` → `{"ok":true,
+   "next":"<redirect_uri>?code=<one-time code>&state=<s>"}` — no cookies on the native path; state
+   echoed. Rate limit: 10 attempts / 60 s / IP → 429.
+3. `POST /auth/native/token` `{code, code_verifier}` →
+   `{access_token, refresh_token, token_type:"Bearer", expires_at, provider, user_id}`.
+   The code is **single-use** — reuse answers 400 "Invalid or expired authorization code."
+4. Use the token: REST `Authorization: Bearer <access_token>` (e.g. `GET /api/auth/me` → 200
+   identity JSON) and WS `?token=<access_token>` → full RPC access. **(verified: ready + RPCs)**
+5. `POST /auth/native/refresh` `{refresh_token}` → rotated token pair (200).
+   **Caveat: with the basic provider (stateless signed tokens), replaying the OLD refresh token
+   still answers 200** — reuse detection ("terminal expiry") is provider-dependent (Portal does
+   it; basic does not). Clients must simply always store the rotated pair.
+
+**Browser ticket path (verified):** `POST /api/auth/ws-ticket` with Bearer → `{ticket,
+ttl_seconds:30}`; WS upgrade with `?ticket=<ticket>` connects; **reuse → 403** (single-use).
 
 ## Connection lifecycle
 
@@ -158,7 +170,14 @@ Notes:
 - Session lifecycle set: `create / resume / activate / active_list / close / delete / archive /
   branch / branch_stored / branch_whole / compress / undo / title / save / set_hidden / info /
   context_breakdown / events.since / events.stats / most_recent / workspace.move / cwd.set /
-  control(.read/.update)` — see the catalog.
+  control(.read/.update)` — see the catalog. Verified round-trips (p07):
+  `session.title → {"pending":false,"title"}`; `session.compress → {"status":"compressed",
+  removed, before/after_messages, before/after_tokens, summary:{noop, headline, token_line,…}}`
+  (noop when nothing to fold); `session.branch → {session_id, stored_session_id,
+  title:"<parent> #2", parent:<stored parent id>}` (history copied); `session.archive →
+  {"archived":true,"session_key"}`; `session.close → {"closed":true}`; `session.delete →
+  {"deleted":"<stored id>"}`; `session.most_recent → {session_id(stored), title, started_at,
+  source}`.
 
 ## Turn lifecycle & streaming events
 
@@ -226,6 +245,16 @@ The current mode rides the `session.info` **event** (`approval_mode`, `yolo`), n
   `approval` field. Answering `{"choice":"deny"}` → `tool.complete` with `output:""`,
   `exit_code:-1`, `error:"BLOCKED: Command denied by user. …"` and the model wraps up explaining
   it won't retry. **(both verified)**
+
+### Clarify flow — verified (p06)
+
+Verbatim request: `{"id":"srq-…","method":"clarify","params":{"session_id":"…","questions":[
+{"qid":"q0","question":"Pick a color","choices":["red (Recommended)","green","blue"],
+"multi_select":false},{"qid":"q1","question":"…","choices":null,"multi_select":false}]}}`.
+Facts: **qids are server-assigned (`q0`…`qN`), not the ones the prompt suggested** — always key
+answers off the received qids; a recommended first choice arrives with a literal
+`" (Recommended)"` suffix (strip it for display if needed); free text = `choices:null`. Answer
+`{"answers":{"q0":"green","q1":"…"}}` → the turn resumes with the answers. **(verified)**
 
 ## Reconnect & resume — verified end-to-end
 
@@ -300,13 +329,25 @@ mkdir -p .probe/home && cp ~/.hermes/.env .probe/home/.env   # provider keys onl
 # config.yaml copied minus mcp_servers, telemetry disabled; random token:
 openssl rand -hex 24 > .probe/token
 
-# run
-HERMES_HOME=$PWD/.probe/home HERMES_DASHBOARD_SESSION_TOKEN=$(cat .probe/token) \
+# run (ungated loopback) — always strip HERMES_PARENT_PID so the desktop's
+# parent-death watchdog can't reap the probe:
+env -u HERMES_PARENT_PID HERMES_HOME=$PWD/.probe/home \
+  HERMES_DASHBOARD_SESSION_TOKEN=$(cat .probe/token) \
+  hermes serve --host 127.0.0.1 --port 9877 --skip-build
+
+# gated variant (basic-auth provider, gate engaged via a fake external public_url;
+# HERMES_DESKTOP must be unset or the desktop loopback exemption relaxes the gate):
+env -u HERMES_PARENT_PID -u HERMES_DESKTOP HERMES_HOME=$PWD/.probe/home \
+  HERMES_DASHBOARD_BASIC_AUTH_USERNAME=probe HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=probe-pass-123 \
+  HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(cat .probe/token) \
+  HERMES_DASHBOARD_PUBLIC_URL=http://probe.example.com \
   hermes serve --host 127.0.0.1 --port 9877 --skip-build
 ```
 
-Probe scripts: `scripts/probe/gw.py` (WS JSON-RPC client + capture), `p01_core_loop.py` (this
-document's core-loop round-trips). Raw frame captures stay local (`.probe/captures/`, gitignored).
+Probe scripts: `scripts/probe/gw.py` (WS JSON-RPC client + capture), `p01_core_loop.py`,
+`p02_steering.py`, `p02b_steer_clean.py`, `p03_approvals.py`, `p04_reconnect.py`, `p05_errors.py`,
+`p06_clarify.py`, `p07_lifecycle.py`, `p08_gated_auth.py`. Raw frame captures stay local
+(`.probe/captures/`, gitignored).
 
 ## Verification log
 
@@ -315,3 +356,5 @@ document's core-loop round-trips). Raw frame captures stay local (`.probe/captur
 | 2026-10-05 | 0.21.5 | Transport + ungated auth; `gateway.ready`; `client.capabilities`; `session.create/list/usage/history/status`; `prompt.submit` ×2 (plain + terminal tool); full turn event sequence; `tool.start/complete` verbatim. |
 | 2026-10-05 | 0.21.5 | `session.steer` (queued → delivered at tool boundary → persisted as `display_kind:"steer"`); `session.interrupt`; busy queueing + turn-supersede race; errors `-32601/-32602/4000/4001/4007/4009/4018/4029`; params coercion caveat; global `row_id` space. |
 | 2026-10-05 | 0.21.5 | Approval flow end-to-end (mode manual): request payload, `approval.pending` replay, `once` (runs, `result.approval`) and `deny` (`exit_code:-1`, `BLOCKED`); `approval_mode` in `session.info` event. Reconnect: WS drop mid-turn → `session.resume` (`inflight`, result keys), `session.events.since` (seq watermark, `truncated`, `epoch`), live re-attach, `session.reclaimed` global frame. |
+| 2026-10-07 | 0.21.5 | `clarify` end-to-end (server-assigned qids, `" (Recommended)"` suffix, `choices:null` = free text). Lifecycle: `session.title/compress/branch/archive/close/delete/most_recent`. |
+| 2026-10-07 | 0.21.5 | Gated auth (basic provider + external `public_url`): loopback relaxation + Desktop exemption; negatives (403/401); PKCE native chain authorize → password-login → native/token → Bearer REST+WS; code single-use; `ws-ticket` mint/connect/reuse-403; refresh rotation (old RT still 200 with basic — provider-dependent reuse detection). |

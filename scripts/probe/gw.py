@@ -50,8 +50,11 @@ class Capture:
 
 
 class GW:
-    def __init__(self, url: str, token: str, capture: Capture | None = None) -> None:
-        self.url = f"{url}?token={token}" if "?" not in url else f"{url}&token={token}"
+    def __init__(self, url: str, token: str | None, capture: Capture | None = None) -> None:
+        if token is None:
+            self.url = url  # caller embedded credentials in the URL already
+        else:
+            self.url = f"{url}?token={token}" if "?" not in url else f"{url}&token={token}"
         self.capture = capture or Capture()
         self.ws = None
         self._pending: dict[str, asyncio.Future] = {}
